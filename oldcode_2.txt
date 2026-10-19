@@ -1,0 +1,398 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import segmentation_models_pytorch as smp
+from thop import profile
+from dataset import get_fast_dataloaders
+import warnings
+import json
+import numpy as np
+warnings.filterwarnings('ignore')
+
+def calculate_metrics(preds, labels):
+    """Calculate TP, FP, FN, TN for binary segmentation"""
+    preds_bool = torch.sigmoid(preds) > 0.5
+    labels_bool = labels > 0.5
+    tp = (preds_bool & labels_bool).sum().item()
+    fp = (preds_bool & ~labels_bool).sum().item()
+    fn = (~preds_bool & labels_bool).sum().item()
+    tn = (~preds_bool & ~labels_bool).sum().item()
+    return tp, fp, fn, tn
+
+def calculate_dice(preds, labels, threshold=0.5):
+    """Calculate Dice score correctly"""
+    preds_binary = (torch.sigmoid(preds) > threshold).float()
+    intersection = (preds_binary * labels).sum()
+    union = preds_binary.sum() + labels.sum()
+    dice = (2. * intersection + 1e-6) / (union + 1e-6)
+    return dice.item()
+
+def validate_batch(images, labels, batch_idx):
+    """Check for NaN/Inf in batch and clean it up"""
+    has_nan_img = torch.isnan(images).any()
+    has_inf_img = torch.isinf(images).any()
+    
+    if has_nan_img or has_inf_img:
+        print(f"⚠️  NaN/Inf detected in images batch {batch_idx}, cleaning...")
+        images = torch.nan_to_num(images, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    has_nan_lbl = torch.isnan(labels).any()
+    has_inf_lbl = torch.isinf(labels).any()
+    
+    if has_nan_lbl or has_inf_lbl:
+        print(f"⚠️  NaN/Inf detected in labels batch {batch_idx}, cleaning...")
+        labels = torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    images = torch.clamp(images, 0.0, 1.0)
+    labels = torch.clamp(labels, 0.0, 1.0)
+    
+    return images, labels
+
+class DiceLoss(nn.Module):
+    """Dice Loss for better segmentation performance"""
+    def __init__(self, smooth=1e-6):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+        
+    def forward(self, preds, targets):
+        preds = torch.sigmoid(preds)
+        preds = preds.view(-1)
+        targets = targets.view(-1)
+        
+        intersection = (preds * targets).sum()
+        dice = (2. * intersection + self.smooth) / (preds.sum() + targets.sum() + self.smooth)
+        return 1 - dice
+
+class CombinedLoss(nn.Module):
+    """Combined BCE + Dice Loss"""
+    def __init__(self, bce_weight=0.5, dice_weight=0.5, pos_weight=None):
+        super(CombinedLoss, self).__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        self.dice = DiceLoss()
+        
+    def forward(self, preds, targets):
+        bce_loss = self.bce(preds, targets)
+        dice_loss = self.dice(preds, targets)
+        return self.bce_weight * bce_loss + self.dice_weight * dice_loss
+
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n{'='*50}")
+    print(f"UNET TRAINING on {device}")
+    print(f"{'='*50}\n")
+
+    # REDUCED BATCH SIZE from 12 to 8 for more updates per epoch
+    train_loader, val_loader, _ = get_fast_dataloaders(
+        tensor_dir="sen1floods11_fast", 
+        batch_size=8,  # Reduced for more frequent updates
+        num_workers=0
+    )
+    
+    print(f"📊 Total batches per epoch: {len(train_loader)}")
+    print(f"📊 Total validation batches: {len(val_loader)}\n")
+
+    # Initialize model with comprehensive regularization
+    print("[1] Initializing model...")
+    model = smp.Unet(
+        encoder_name="resnet18",
+        encoder_weights="imagenet", 
+        in_channels=2, 
+        classes=1,
+        decoder_dropout=0.5
+    ).to(device)
+
+    # Profile model
+    dummy_input = torch.randn(1, 2, 512, 512).to(device)
+    macs, params = profile(model, inputs=(dummy_input, ), verbose=False)
+    print(f"Model Parameters: {params / 1e6:.2f} M")
+    print(f"Computational Complexity: {macs / 1e9 * 2:.2f} GFLOPs\n")
+
+    # Loss
+    pos_weight = torch.tensor([3.0]).to(device)
+    criterion = CombinedLoss(
+        bce_weight=0.5,
+        dice_weight=0.5,
+        pos_weight=pos_weight
+    )
+    
+    # Optimizer
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=0.0001,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
+    
+    # More aggressive scheduler with warmup
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        patience=5,  # Increased patience
+        factor=0.5,
+        threshold=1e-4,
+        min_lr=1e-6,
+        cooldown=2  # Wait 2 epochs before reducing again
+    )
+    
+    # Mixed precision training
+    scaler = torch.cuda.amp.GradScaler()
+    max_grad_norm = 0.5
+
+    num_epochs = 100  # Increased to 100 epochs
+    patience = 15  # More patient early stopping
+    best_val_loss = float('inf')
+    best_val_acc = 0.0
+    epochs_no_improve = 0
+    best_epoch = 0
+
+    # Store history
+    history = {
+        'train_loss': [], 
+        'val_loss': [], 
+        'train_acc': [], 
+        'val_acc': [],
+        'train_dice': [],
+        'val_dice': [],
+        'learning_rates': []
+    }
+    
+    print("[2] Starting training...\n")
+    print(f"{'='*60}")
+    
+    for epoch in range(num_epochs):
+        # Training phase
+        model.train()
+        train_loss = 0.0
+        tr_tp, tr_fp, tr_fn, tr_tn = 0, 0, 0, 0
+        valid_batches = 0
+        train_dice = 0.0
+        
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            
+            images, labels = validate_batch(images, labels, batch_idx)
+            
+            optimizer.zero_grad()
+            
+            try:
+                with torch.cuda.amp.autocast():
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"⚠️  Invalid loss in batch {batch_idx}, skipping...")
+                    continue
+                
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                
+                train_loss += loss.item()
+                tp, fp, fn, tn = calculate_metrics(outputs, labels)
+                tr_tp += tp
+                tr_fp += fp
+                tr_fn += fn
+                tr_tn += tn
+                valid_batches += 1
+                
+                # Calculate Dice - FIXED
+                train_dice += calculate_dice(outputs, labels)
+                
+            except Exception as e:
+                print(f"⚠️  Error in batch {batch_idx}: {e}, skipping...")
+                continue
+            
+            # Progress indicator (less frequent now)
+            if batch_idx % 50 == 0 and batch_idx > 0:
+                progress = (batch_idx / len(train_loader)) * 100
+                print(f"   Epoch {epoch+1}: {progress:.0f}% complete", end='\r')
+        
+        if valid_batches == 0:
+            print(f"⚠️  No valid batches in epoch {epoch+1}, skipping...")
+            continue
+            
+        avg_train_loss = train_loss / valid_batches
+        train_acc = (tr_tp + tr_tn) / (tr_tp + tr_tn + tr_fp + tr_fn + 1e-8)
+        avg_train_dice = train_dice / valid_batches
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        v_tp, v_fp, v_fn, v_tn = 0, 0, 0, 0
+        valid_val_batches = 0
+        val_dice = 0.0
+        
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                
+                images, labels = validate_batch(images, labels, -1)
+                
+                try:
+                    with torch.cuda.amp.autocast():
+                        outputs = model(images)
+                        loss = criterion(outputs, labels)
+                    
+                    if not (torch.isnan(loss) or torch.isinf(loss)):
+                        val_loss += loss.item()
+                        tp, fp, fn, tn = calculate_metrics(outputs, labels)
+                        v_tp += tp
+                        v_fp += fp
+                        v_fn += fn
+                        v_tn += tn
+                        valid_val_batches += 1
+                        
+                        # Calculate Dice - FIXED
+                        val_dice += calculate_dice(outputs, labels)
+                except Exception as e:
+                    print(f"⚠️  Error in validation: {e}")
+                    continue
+                
+        if valid_val_batches == 0:
+            print(f"⚠️  No valid validation batches in epoch {epoch+1}")
+            avg_val_loss = float('inf')
+            val_acc = 0.0
+            avg_val_dice = 0.0
+        else:
+            avg_val_loss = val_loss / valid_val_batches
+            val_acc = (v_tp + v_tn) / (v_tp + v_tn + v_fp + v_fn + 1e-8)
+            avg_val_dice = val_dice / valid_val_batches
+        
+        # Store history
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
+        history['train_acc'].append(train_acc)
+        history['val_acc'].append(val_acc)
+        history['train_dice'].append(avg_train_dice)
+        history['val_dice'].append(avg_val_dice)
+        history['learning_rates'].append(optimizer.param_groups[0]['lr'])
+        
+        # Print epoch summary (cleaner output)
+        print(f"\nEpoch [{epoch+1}/{num_epochs}]")
+        print(f"  Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.4f} | Train Dice: {avg_train_dice:.4f}")
+        print(f"  Val Loss:   {avg_val_loss:.4f} | Val Acc:   {val_acc:.4f} | Val Dice:   {avg_val_dice:.4f}")
+        print(f"  LR:         {optimizer.param_groups[0]['lr']:.6f}")
+        
+        # Check if learning rate changed
+        prev_lr = history['learning_rates'][-2] if len(history['learning_rates']) > 1 else optimizer.param_groups[0]['lr']
+        scheduler.step(avg_val_loss)
+        
+        current_lr = optimizer.param_groups[0]['lr']
+        if current_lr != prev_lr:
+            print(f"  📊 Learning rate reduced to: {current_lr:.6f}")
+        
+        # Save best model based on validation accuracy (not loss)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_val_loss = avg_val_loss
+            best_epoch = epoch + 1
+            epochs_no_improve = 0
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                'best_val_acc': best_val_acc,
+                'history': history
+            }, "unet_best_model.pth")
+            print(f"  ✓ Best model saved! (Val Acc: {best_val_acc:.4f}, Val Loss: {best_val_loss:.4f})")
+        else:
+            epochs_no_improve += 1
+            print(f"  No accuracy improvement for {epochs_no_improve} epoch(s)")
+            
+            # Early stopping with higher patience
+            if epochs_no_improve >= patience:
+                print(f"\n[!] Early stopping triggered at epoch {epoch+1}")
+                print(f"[!] Best validation accuracy: {best_val_acc:.4f} at epoch {best_epoch}")
+                break
+            
+            # Check if validation loss is increasing significantly
+            if len(history['val_loss']) > 5:
+                recent_losses = history['val_loss'][-5:]
+                if all(recent_losses[i] > recent_losses[i-1] for i in range(1, len(recent_losses))):
+                    print(f"  ⚠️  Validation loss increasing for 5 epochs - consider stopping")
+        
+        print("-" * 60)
+    
+    # Save training history
+    with open('training_history.json', 'w') as f:
+        json.dump(history, f, indent=2)
+    
+    # Load best model for final evaluation
+    checkpoint = torch.load('unet_best_model.pth')
+    model.load_state_dict(checkpoint['model_state_dict'])
+    best_val_acc = checkpoint['best_val_acc']
+    best_val_loss = checkpoint['best_val_loss']
+    best_epoch = checkpoint['epoch']
+    
+    # Final evaluation on validation set
+    model.eval()
+    final_val_loss = 0.0
+    final_val_acc = 0.0
+    final_val_dice = 0.0
+    valid_val_batches = 0
+    
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            images, labels = validate_batch(images, labels, -1)
+            
+            try:
+                with torch.cuda.amp.autocast():
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                
+                if not (torch.isnan(loss) or torch.isinf(loss)):
+                    final_val_loss += loss.item()
+                    tp, fp, fn, tn = calculate_metrics(outputs, labels)
+                    val_acc = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+                    final_val_acc += val_acc
+                    final_val_dice += calculate_dice(outputs, labels)
+                    valid_val_batches += 1
+            except Exception as e:
+                continue
+    
+    if valid_val_batches > 0:
+        final_val_loss /= valid_val_batches
+        final_val_acc /= valid_val_batches
+        final_val_dice /= valid_val_batches
+    
+    print(f"\n{'='*60}")
+    print(f"✓ TRAINING COMPLETE!")
+    print(f"{'='*60}")
+    print(f"✓ Best epoch: {best_epoch}")
+    print(f"✓ Best validation accuracy: {best_val_acc:.4f} ({best_val_acc*100:.2f}%)")
+    print(f"✓ Best validation loss: {best_val_loss:.4f}")
+    print(f"✓ Final validation Dice: {final_val_dice:.4f}")
+    print(f"✓ Model saved to 'unet_best_model.pth'")
+    print(f"✓ Training history saved to 'training_history.json'")
+    
+    # Print summary statistics
+    print(f"\n📊 Training Summary:")
+    print(f"  • Total epochs trained: {len(history['train_loss'])}")
+    print(f"  • Early stopping: {'Yes' if epochs_no_improve >= patience else 'No'}")
+    print(f"  • Final LR: {optimizer.param_groups[0]['lr']:.6f}")
+    print(f"  • Best val accuracy: {best_val_acc:.4f}")
+    print(f"  • Final val Dice: {final_val_dice:.4f}")
+    
+    # Print final recommendations
+    print(f"\n💡 Recommendations:")
+    if best_val_acc > 0.95:
+        print(f"  ✅ Excellent! Model achieved {best_val_acc*100:.2f}% accuracy")
+    elif best_val_acc > 0.90:
+        print(f"  ✅ Good! Model achieved {best_val_acc*100:.2f}% accuracy")
+    else:
+        print(f"  ⚠️  Consider more data or different architecture")
+    
+    print(f"{'='*60}\n")
+
+if __name__ == "__main__":
+    train()

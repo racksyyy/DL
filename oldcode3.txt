@@ -1,0 +1,206 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import segmentation_models_pytorch as smp
+import matplotlib.pyplot as plt
+import numpy as np
+from dataset import get_fast_dataloaders
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# 1. OPTIMIZED LOSS (Anti-Overfitting)
+# ==========================================
+class DiceBCELoss(nn.Module):
+    def __init__(self, bce_weight=0.5, pos_weight_val=5.0):
+        super(DiceBCELoss, self).__init__()
+        self.bce_weight = bce_weight
+        pos_weight = torch.tensor([pos_weight_val]).cuda()
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        self.dice = smp.losses.DiceLoss(smp.losses.BINARY_MODE, from_logits=True)
+
+    def forward(self, inputs, targets):
+        bce_loss = self.bce(inputs, targets)
+        dice_loss = self.dice(inputs, targets)
+        return (self.bce_weight * bce_loss) + ((1 - self.bce_weight) * dice_loss)
+
+# ==========================================
+# 2. METRICS & BLAZING FAST CLEANUP
+# ==========================================
+def calculate_metrics(preds, labels):
+    preds_bool = torch.sigmoid(preds) > 0.5
+    labels_bool = labels > 0.5
+    tp = (preds_bool & labels_bool).sum().item()
+    fp = (preds_bool & ~labels_bool).sum().item()
+    fn = (~preds_bool & labels_bool).sum().item()
+    tn = (~preds_bool & ~labels_bool).sum().item()
+    return tp, fp, fn, tn
+
+def clean_batch(tensor):
+    """Direct GPU operation. No 'if' statements = No CPU/GPU sync bottleneck."""
+    tensor = torch.nan_to_num(tensor, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.clamp(tensor, 0.0, 1.0)
+
+# ==========================================
+# 3. MAIN TRAINING LOOP
+# ==========================================
+def train():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n--- FAST UNET TRAINING ON {device} ---")
+
+    # num_workers=0 ensures Windows won't freeze!
+    train_loader, val_loader, test_loader = get_fast_dataloaders(
+        tensor_dir="sen1floods11_fast", batch_size=16, num_workers=0
+    )
+
+    model = smp.Unet(encoder_name="resnet34", encoder_weights="imagenet", in_channels=2, classes=1).to(device)
+
+    # Anti-overfit components (Learning rate fixed to 1e-4)
+    criterion = DiceBCELoss(bce_weight=0.5, pos_weight_val=5.0)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
+    
+    scaler = torch.amp.GradScaler('cuda')
+    max_grad_norm = 1.0
+
+    num_epochs = 50 
+    patience = 8  
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    history = {'train_loss': [], 'val_loss': [], 'train_dice': [], 'val_dice': []}
+    
+    for epoch in range(num_epochs):
+        # --- TRAINING ---
+        model.train()
+        train_loss = 0.0
+        tr_tp, tr_fp, tr_fn, tr_tn = 0, 0, 0, 0
+        valid_batches = 0
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        for images, labels in train_loader:
+            images = clean_batch(images.to(device, non_blocking=True))
+            labels = clean_batch(labels.to(device, non_blocking=True))
+            
+            optimizer.zero_grad()
+            
+            with torch.amp.autocast('cuda'):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            
+            # Skip instantly on the rare chance of a bad loss without slowing down
+            if torch.isnan(loss) or torch.isinf(loss): continue
+            
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_loss += loss.item()
+            tp, fp, fn, tn = calculate_metrics(outputs, labels)
+            tr_tp += tp; tr_fp += fp; tr_fn += fn; tr_tn += tn
+            valid_batches += 1
+            
+        if valid_batches == 0: continue
+        avg_train_loss = train_loss / valid_batches
+        train_dice = (2 * tr_tp) / (2 * tr_tp + tr_fp + tr_fn + 1e-8)
+        
+        # --- VALIDATION ---
+        model.eval()
+        val_loss = 0.0
+        v_tp, v_fp, v_fn, v_tn = 0, 0, 0, 0
+        valid_val_batches = 0
+        
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images = clean_batch(images.to(device, non_blocking=True))
+                labels = clean_batch(labels.to(device, non_blocking=True))
+                
+                with torch.amp.autocast('cuda'):
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                
+                if not (torch.isnan(loss) or torch.isinf(loss)):
+                    val_loss += loss.item()
+                    tp, fp, fn, tn = calculate_metrics(outputs, labels)
+                    v_tp += tp; v_fp += fp; v_fn += fn; v_tn += tn
+                    valid_val_batches += 1
+                
+        if valid_val_batches > 0:
+            avg_val_loss = val_loss / valid_val_batches
+            val_dice = (2 * v_tp) / (2 * v_tp + v_fp + v_fn + 1e-8)
+        else:
+            avg_val_loss = float('inf')
+            val_dice = 0.0
+        
+        scheduler.step(avg_val_loss)
+        history['train_loss'].append(avg_train_loss); history['val_loss'].append(avg_val_loss)
+        history['train_dice'].append(train_dice); history['val_dice'].append(val_dice)
+        
+        print(f"Epoch [{epoch+1}/{num_epochs}] | LR: {current_lr:.1e} | T.Loss: {avg_train_loss:.4f} | V.Loss: {avg_val_loss:.4f} | T.Dice: {train_dice:.4f} | V.Dice: {val_dice:.4f}")
+        
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), "unet_best_weights.pth")
+            print(f"[*] Best weights saved! (Val Loss: {best_val_loss:.4f})")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"\n[!] Early stopping triggered at epoch {epoch+1}")
+                break
+
+    # ==========================================
+    # 4. PLOTS & FINAL EVALUATION
+    # ==========================================
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1); plt.plot(history['train_loss'], label='Train Loss'); plt.plot(history['val_loss'], label='Val Loss')
+    plt.title('Loss Convergence'); plt.legend(); plt.grid(True, linestyle='--', alpha=0.6)
+    plt.subplot(1, 2, 2); plt.plot(history['train_dice'], label='Train Dice'); plt.plot(history['val_dice'], label='Val Dice')
+    plt.title('Dice Score'); plt.legend(); plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig('unet_training_plots.png')
+    
+    print("\n--- Running Final Evaluation ---")
+    try: model.load_state_dict(torch.load("unet_best_weights.pth", weights_only=True))
+    except: pass
+    
+    model.eval()
+    t_tp, t_fp, t_fn, t_tn = 0, 0, 0, 0
+    sample_images, sample_preds, sample_labels = [], [], []
+
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = clean_batch(images.to(device))
+            labels = clean_batch(labels.to(device))
+            
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            
+            if not (torch.isnan(loss) or torch.isinf(loss)):
+                tp, fp, fn, tn = calculate_metrics(outputs, labels)
+                t_tp += tp; t_fp += fp; t_fn += fn; t_tn += tn
+                
+                if len(sample_images) < 6:
+                    sample_images.append(images[0, 0].cpu().numpy())
+                    sample_labels.append(labels[0, 0].cpu().numpy())
+                    sample_preds.append((torch.sigmoid(outputs[0, 0]) > 0.5).cpu().numpy())
+
+    accuracy = (t_tp + t_tn) / (t_tp + t_tn + t_fp + t_fn + 1e-8)
+    iou = t_tp / (t_tp + t_fp + t_fn + 1e-8)
+    dice = 2 * t_tp / (2 * t_tp + t_fp + t_fn + 1e-8)
+    
+    print(f"\n[FINAL TEST METRICS]")
+    print(f"Accuracy:   {accuracy:.4f}\nIoU:        {iou:.4f}\nDice Coeff: {dice:.4f}")
+    
+    if len(sample_images) > 0:
+        fig, axes = plt.subplots(len(sample_images), 3, figsize=(10, 6*len(sample_images)))
+        if len(sample_images) == 1: axes = [axes]
+        for i in range(len(sample_images)):
+            axes[i, 0].imshow(sample_images[i], cmap='gray'); axes[i, 0].axis('off')
+            axes[i, 1].imshow(sample_labels[i], cmap='Blues'); axes[i, 1].axis('off')
+            axes[i, 2].imshow(sample_preds[i], cmap='Reds'); axes[i, 2].axis('off')
+        plt.tight_layout()
+        plt.savefig('unet_test_samples.png')
+
+if __name__ == "__main__":
+    train()

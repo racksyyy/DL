@@ -1,0 +1,31 @@
+============================================================
+UNET EVALUATION METRICS
+============================================================
+
+Number of Test Samples: 90
+
+PER-SAMPLE AVERAGE METRICS:
+----------------------------------------
+Mean IoU:          0.2847
+Mean Dice:         0.3780
+Mean Accuracy:     0.9185
+Mean Precision:    0.4127
+Mean Recall:       0.4852
+Mean F1 Score:     0.3780
+
+OVERALL METRICS:
+----------------------------------------
+Overall IoU:       0.4233
+Overall Dice:      0.5948
+Overall Accuracy:  0.9185
+Overall Precision: 0.5149
+Overall Recall:    0.7039
+Overall F1 Score:  0.5948
+
+CONFUSION MATRIX:
+----------------------------------------
+True Positives:   1410625
+False Positives:  1328749
+False Negatives:   593257
+True Negatives:  20260329
+============================================================
